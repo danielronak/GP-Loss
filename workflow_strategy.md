@@ -19,7 +19,9 @@
 
 ## 0. Claude's review notes: suggested changes (2026-09-29)
 
-These notes come from reading the spec, the kickoff brief and all four prior notebooks. They are proposals. Nothing below has been built yet. Items marked **[DECIDE]** are yours to call.
+These notes come from reading the spec, the kickoff brief and all four prior notebooks.
+
+> **Decisions (2026-09-29):** Fashion-MNIST for Phase 0 and the zoo. A smaller Phase 0 is fine only if it can genuinely answer the question, so Phase 0 is now **5 cheap evolution runs per arm** (see §0.3). Phase 0 runs on the **free Colab tier**. Implemented in `src/phase0.py` + `notebooks/ACLE_Phase0.ipynb`.
 
 ### 0.1 How we actually work (differs from the diagram above)
 
@@ -45,12 +47,19 @@ pop 20 × gen 20 is up to 400 evaluations × 8 epochs = ~3,200 epochs per evolut
 4. Smoke-test filter (already planned). It kills the ~2%-accuracy "random" individuals that filled the old logs.
 5. **First Colab action: a 2-minute timing cell** (one evaluation per architecture). We size pop/gen/epochs from real numbers.
 
-Phase 0 proposal: run a reduced config (pop 20, gen ~10, 3–4 epochs, subset data), with **3 evolution seeds per operator set**. Then retrain each run's best tree on **5 training seeds** on the held-out test set. That satisfies "≥5 seeds before any claim" for the comparison without paying for 10 full evolutions.
+~~3 evolution seeds per operator set~~. **Revised, as built:** 3 runs per arm cannot answer the question. Search randomness (which tree a run happens to find) is the dominant noise, so the run is the unit of replication. With 3 vs 3 runs the smallest attainable permutation p-value is 1/20 = 0.05, so a lift can never be called significant. With **5 vs 5 it is 1/252**. Levers 1–4 make each run cheap enough to afford that. Protocol (`src/phase0.py`, `configs/phase0_ceiling_test.yaml`):
+- SimpleCNN, Fashion-MNIST. Fitness = accuracy on a fixed 5k val subset after 5 epochs on a fixed 10k train subset; pop 20, 15 generations.
+- The arms differ only in operator set (`baseline` vs `tier1`). Runs with the same seed share model inits and batch order.
+- Each run's val-best tree is retrained on the full 50k train split for 10 epochs and scored on the untouched test set over 5 shared seeds. CE and MSE are reference rows on the same seeds.
+- **PASS** iff the one-sided exact permutation p < 0.05 over runs **and** the lift is ≥ max(0.2 pp, 25% of the CE-vs-baseline gap). The rule is fixed in code before any data is seen.
+- Run order interleaves the arms, so a partial budget still gives a balanced (provisional) answer.
+
+Time is estimated by the notebook's benchmark cell; paste its output to Claude before the long run.
 
 ### 0.4 A design subtlety in Phase 0 worth knowing up front
 
 With `p_target` exposed, `neg(log(p_target))` **is exactly CrossEntropy** and is reachable at tree depth 2. So the expanded search space literally contains CE. In practice Phase 0 answers "does GP find CE (or something at least as good)?" That is still a useful gate, but frame it that way. Two implementation consequences:
-- **Shapes:** `error` is `(B, C)`; `p_target` is per-sample. Claude will broadcast `p_target` as `(B, 1)` and reduce with a sum over classes followed by a mean over the batch. That turns a pure `-log(p_target)` tree into `C × CE`. Under Adam that scaling is nearly irrelevant, but the unit test will check it explicitly.
+- **Shapes (as built):** `error` is `(B, C)`; `p_target` is `(B, 1)`. The reduction is a sum over the class dimension, then a mean over the batch. A pure `neg(log(p_target))` tree is therefore **exactly** CE (unit-tested, gradients included). In mixed trees such as `add(square(error), neg(log(p_target)))`, the `p_target` term broadcasts across classes and is counted C times.
 - **Trivial penalty:** do *not* put `neg(log(p_target))` in `TRIVIAL_SET`. Instead, log whenever evolution rediscovers CE, since that is itself a Phase 0 finding.
 
 ### 0.5 Bugs in the Phase 4b reference code (`Optimized_loss_GP.ipynb`): fix while porting
@@ -63,6 +72,11 @@ The kickoff says "port verbatim". These should still be fixed, and each fix will
 5. **`dill.load` fails in a fresh runtime unless DEAP `creator` classes exist first** (verified). Importing `src.gp_core` will always create them, so a post-restart resume just works.
 6. **Elitism ranks by *shared* fitness,** so the raw-best tree can drop out of the population. The notebook had to dig it out of the archive by hand. Add a hall-of-fame tracking best-by-raw-accuracy.
 7. The kickoff's early-kill threshold "<15% on 10-class" should be expressed relative to chance (`k / num_classes`). Chance was 2% on 50-way Omniglot.
+8. *(found while building)* **Constant subtrees crashed.** `torch.maximum`/`minimum` and every unary torch op raise `TypeError` on a Python float. Any tree like `tanh(sqrt(0.43))`, `max(error, 1.2)` or `square(0.72)` threw, and the wrapper silently turned that into the zero-gradient penalty, so the tree scored chance. The Phase 4b logs are full of these "Raw=2.00%" individuals. Fixed with constant-safe primitives.
+9. *(found while building)* **Max-depth limit bypassed.** The loop called `gp.cxOnePoint`/`gp.mutUniform` directly, not the `staticLimit`-decorated `toolbox.mate`/`toolbox.mutate`, so trees could grow past depth 5. Fixed.
+10. *(found while building)* The penalty fallback `1000 * mean(probs)` is a constant (softmax rows sum to 1), so it has zero gradient. NaN trees therefore trained on nothing but were still scored. The smoke test now kills them up front.
+
+All fixes are listed in the docstring of `src/evolve.py` / `src/gp_core.py`.
 
 ### 0.6 H2 metric note
 

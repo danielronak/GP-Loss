@@ -16,3 +16,8 @@ env/
 # IDE / Editor files
 .vscode/
 .idea/
+
+# ACLE local artifacts (checkpoints live on Google Drive)
+checkpoints/
+data/
+.pytest_cache/
