@@ -17,6 +17,59 @@
 
 ---
 
+## 0. Claude's review notes: suggested changes (2026-09-29)
+
+These notes come from reading the spec, the kickoff brief and all four prior notebooks. They are proposals. Nothing below has been built yet. Items marked **[DECIDE]** are yours to call.
+
+### 0.1 How we actually work (differs from the diagram above)
+
+- **Claude Code runs in a cloud container, not on your local machine.** The loop is still the same: Claude writes `src/` + tests, runs CPU unit tests in the container (PyTorch CPU and DEAP install there), then pushes. You pull in Colab.
+- **Branch:** Claude pushes to `claude/stoic-knuth-jenuuo`, not `main`. Colab must clone or pull *that branch* (see the updated setup cell in §2). Merge to `main` whenever you like.
+- **Private repo?** If the repo is private, Colab needs a GitHub token to clone. Store a fine-grained PAT in Colab's *Secrets* panel (e.g. `GH_TOKEN`) and clone with `https://$GH_TOKEN@github.com/...`. Never paste the token into a notebook cell.
+- **Getting results back to Claude:** Claude cannot see your Drive. Each run will write a small `results/*.json|csv` summary and print a compact text summary at the end. Either (a) paste that printed summary into chat, or (b) commit `results/` from Colab (needs the token above). Checkpoints stay on Drive.
+
+### 0.2 Headroom problem: MNIST is probably too easy **[DECIDE]**
+
+Your Phase 1 notebook got CE = 98.56% and the evolved loss = 98.43% after 3 epochs, a **0.13%** gap. At 8 epochs A/B will all sit at ~99%. With a ceiling that tight:
+- Phase 0 cannot show a "ceiling lift", because there is no gap left to close.
+- The transfer matrix cannot show diagonal dominance, because every cell is ~99% ± noise.
+
+**Suggestion:** use **Fashion-MNIST** (CE ≈ 90–92%, same 28×28×1 shape, same cost) for Phase 0 and the zoo. A reduced-train-set MNIST is an alternative. The spec already allows Fashion-MNIST.
+
+### 0.3 Compute realism **[DECIDE]**
+
+pop 20 × gen 20 is up to 400 evaluations × 8 epochs = ~3,200 epochs per evolution. Full 60k-image MNIST through a `DataLoader` on a T4 runs about 8–15 s/epoch, which is **~7–13 h per evolution**, not the ~1–2 h estimated. Phase 0 with 5 seeds × 2 operator sets would mean 10 evolutions. Planned levers (all cheap to build):
+1. **Preload the dataset as GPU tensors** and batch by slicing (no DataLoader/PIL). Often 5–10× faster at this scale.
+2. **Fitness on a fixed subset** (e.g. 10k train / 5k val). Final numbers still use the full held-out test set.
+3. **Evaluation cache keyed by tree string**, so elites and unchanged crossover children don't retrain. The old loop retrained them.
+4. Smoke-test filter (already planned). It kills the ~2%-accuracy "random" individuals that filled the old logs.
+5. **First Colab action: a 2-minute timing cell** (one evaluation per architecture). We size pop/gen/epochs from real numbers.
+
+Phase 0 proposal: run a reduced config (pop 20, gen ~10, 3–4 epochs, subset data), with **3 evolution seeds per operator set**. Then retrain each run's best tree on **5 training seeds** on the held-out test set. That satisfies "≥5 seeds before any claim" for the comparison without paying for 10 full evolutions.
+
+### 0.4 A design subtlety in Phase 0 worth knowing up front
+
+With `p_target` exposed, `neg(log(p_target))` **is exactly CrossEntropy** and is reachable at tree depth 2. So the expanded search space literally contains CE. In practice Phase 0 answers "does GP find CE (or something at least as good)?" That is still a useful gate, but frame it that way. Two implementation consequences:
+- **Shapes:** `error` is `(B, C)`; `p_target` is per-sample. Claude will broadcast `p_target` as `(B, 1)` and reduce with a sum over classes followed by a mean over the batch. That turns a pure `-log(p_target)` tree into `C × CE`. Under Adam that scaling is nearly irrelevant, but the unit test will check it explicitly.
+- **Trivial penalty:** do *not* put `neg(log(p_target))` in `TRIVIAL_SET`. Instead, log whenever evolution rediscovers CE, since that is itself a Phase 0 finding.
+
+### 0.5 Bugs in the Phase 4b reference code (`Optimized_loss_GP.ipynb`): fix while porting
+
+The kickoff says "port verbatim". These should still be fixed, and each fix will be noted in code comments:
+1. **Resume re-runs the saved generation.** The checkpoint is written *after evaluation but before breeding*. On resume, the loop re-processes that same population: Gen 22 stats in the notebook are identical to Gen 21. It also appends the population to the novelty archive a second time, which skews novelty bonuses. Fix: checkpoint the bred next generation, or breed first on resume.
+2. **`range(start_gen, start_gen + n_generations)`** runs *n more* generations on resume, not up to *n total*. That is why the "20-generation" run ended at gen 21/31. Fix: loop to `config.generations`.
+3. **RNG state is not checkpointed**, so resume isn't reproducible. The plan in §4 already fixes this.
+4. **Fitness was measured on the same `test_loader` later used for the final comparison.** The new code keeps train / val (fitness) / test (reporting only) strictly separate.
+5. **`dill.load` fails in a fresh runtime unless DEAP `creator` classes exist first** (verified). Importing `src.gp_core` will always create them, so a post-restart resume just works.
+6. **Elitism ranks by *shared* fitness,** so the raw-best tree can drop out of the population. The notebook had to dig it out of the archive by hand. Add a hall-of-fame tracking best-by-raw-accuracy.
+7. The kickoff's early-kill threshold "<15% on 10-class" should be expressed relative to chance (`k / num_classes`). Chance was 2% on 50-way Omniglot.
+
+### 0.6 H2 metric note
+
+`tree_distance` is a character-by-character `zip` of the two expression strings, not a true edit distance. Small prefix changes shift everything. Keep it as-is *inside* the evolution loop so the mechanisms match Phase 4b. For the **H2 structural-divergence analysis**, also report a proper tree edit distance (Zhang–Shasha, e.g. the `zss` package) so the paper's key Tier-1 number rests on a defensible metric.
+
+---
+
 ## 1. Compute Budget Planning (100 Compute Units)
 
 ### What 100 units buys you
@@ -93,12 +146,15 @@ drive.mount('/content/drive')
 
 !pip install -q deap dill pyyaml
 
-# Clone or pull latest code
+# Clone or pull latest code (branch Claude pushes to; see §0.1)
 import os
+BRANCH = 'claude/stoic-knuth-jenuuo'
 if not os.path.exists('/content/GP-Loss'):
-    !git clone https://github.com/danielronak/GP-Loss.git /content/GP-Loss
+    # private repo: from google.colab import userdata; token = userdata.get('GH_TOKEN')
+    # and use f'https://{token}@github.com/danielronak/GP-Loss.git'
+    !git clone -b {BRANCH} https://github.com/danielronak/GP-Loss.git /content/GP-Loss
 else:
-    !cd /content/GP-Loss && git pull
+    !cd /content/GP-Loss && git fetch origin {BRANCH} && git checkout {BRANCH} && git pull origin {BRANCH}
 
 import sys
 sys.path.insert(0, '/content/GP-Loss')
@@ -122,7 +178,7 @@ from src.config import EvolutionConfig
 ```
 1. Claude Code writes/edits src/ files locally
 2. You review and commit:  git add . && git commit -m "..." && git push
-3. In Colab: !cd /content/GP-Loss && git pull
+3. In Colab: !cd /content/GP-Loss && git pull origin claude/stoic-knuth-jenuuo
 4. Run the experiment
 5. Results save to Google Drive (checkpoints/) or to results/ in the repo
 6. Download results locally if needed for analysis
@@ -131,7 +187,7 @@ from src.config import EvolutionConfig
 
 ### Branch strategy (keep it simple)
 
-- Work on `main`. This is a research project with one developer, not production software.
+- Claude pushes to `claude/stoic-knuth-jenuuo`; Colab pulls that branch. Merge to `main` at milestones (e.g. after Phase 0) if you want a clean `main`.
 - Commit often, with descriptive messages. You'll want the history when writing the paper.
 - Tag meaningful milestones: `git tag phase0-pass` or `git tag phase0-fail`.
 
@@ -311,7 +367,7 @@ Each Colab session should follow this pattern:
 # Cell 1: Mount + Setup (30 seconds)
 drive.mount(...)
 !pip install -q deap dill pyyaml
-!cd /content/GP-Loss && git pull
+!cd /content/GP-Loss && git pull origin claude/stoic-knuth-jenuuo
 sys.path.insert(0, '/content/GP-Loss')
 
 # Cell 2: Configure (set seed, phase, architecture)
