@@ -17,6 +17,73 @@
 
 ---
 
+## 0. Claude's review notes: suggested changes (2026-09-29)
+
+These notes come from reading the spec, the kickoff brief and all four prior notebooks.
+
+> **Decisions (2026-09-29):** Fashion-MNIST for Phase 0 and the zoo. A smaller Phase 0 is fine only if it can genuinely answer the question, so Phase 0 is now **5 cheap evolution runs per arm** (see §0.3). Phase 0 runs on the **free Colab tier**. Implemented in `src/phase0.py` + `notebooks/ACLE_Phase0.ipynb`.
+
+### 0.1 How we actually work (differs from the diagram above)
+
+- **Claude Code runs in a cloud container, not on your local machine.** The loop is still the same: Claude writes `src/` + tests, runs CPU unit tests in the container (PyTorch CPU and DEAP install there), then pushes. You pull in Colab.
+- **Branch:** Claude pushes to `claude/stoic-knuth-jenuuo`, not `main`. Colab must clone or pull *that branch* (see the updated setup cell in §2). Merge to `main` whenever you like.
+- **Private repo?** If the repo is private, Colab needs a GitHub token to clone. Store a fine-grained PAT in Colab's *Secrets* panel (e.g. `GH_TOKEN`) and clone with `https://$GH_TOKEN@github.com/...`. Never paste the token into a notebook cell.
+- **Getting results back to Claude:** Claude cannot see your Drive. Each run will write a small `results/*.json|csv` summary and print a compact text summary at the end. Either (a) paste that printed summary into chat, or (b) commit `results/` from Colab (needs the token above). Checkpoints stay on Drive.
+
+### 0.2 Headroom problem: MNIST is probably too easy **[DECIDE]**
+
+Your Phase 1 notebook got CE = 98.56% and the evolved loss = 98.43% after 3 epochs, a **0.13%** gap. At 8 epochs A/B will all sit at ~99%. With a ceiling that tight:
+- Phase 0 cannot show a "ceiling lift", because there is no gap left to close.
+- The transfer matrix cannot show diagonal dominance, because every cell is ~99% ± noise.
+
+**Suggestion:** use **Fashion-MNIST** (CE ≈ 90–92%, same 28×28×1 shape, same cost) for Phase 0 and the zoo. A reduced-train-set MNIST is an alternative. The spec already allows Fashion-MNIST.
+
+### 0.3 Compute realism **[DECIDE]**
+
+pop 20 × gen 20 is up to 400 evaluations × 8 epochs = ~3,200 epochs per evolution. Full 60k-image MNIST through a `DataLoader` on a T4 runs about 8–15 s/epoch, which is **~7–13 h per evolution**, not the ~1–2 h estimated. Phase 0 with 5 seeds × 2 operator sets would mean 10 evolutions. Planned levers (all cheap to build):
+1. **Preload the dataset as GPU tensors** and batch by slicing (no DataLoader/PIL). Often 5–10× faster at this scale.
+2. **Fitness on a fixed subset** (e.g. 10k train / 5k val). Final numbers still use the full held-out test set.
+3. **Evaluation cache keyed by tree string**, so elites and unchanged crossover children don't retrain. The old loop retrained them.
+4. Smoke-test filter (already planned). It kills the ~2%-accuracy "random" individuals that filled the old logs.
+5. **First Colab action: a 2-minute timing cell** (one evaluation per architecture). We size pop/gen/epochs from real numbers.
+
+~~3 evolution seeds per operator set~~. **Revised, as built:** 3 runs per arm cannot answer the question. Search randomness (which tree a run happens to find) is the dominant noise, so the run is the unit of replication. With 3 vs 3 runs the smallest attainable permutation p-value is 1/20 = 0.05, so a lift can never be called significant. With **5 vs 5 it is 1/252**. Levers 1–4 make each run cheap enough to afford that. Protocol (`src/phase0.py`, `configs/phase0_ceiling_test.yaml`):
+- SimpleCNN, Fashion-MNIST. Fitness = accuracy on a fixed 5k val subset after 8 epochs on a fixed 10k train subset; pop 20, 20 generations (the Spec §6.9 defaults; the T4 benchmark put this at ~1.8 h total).
+- The arms differ only in operator set (`baseline` vs `tier1`). Runs with the same seed share model inits and batch order.
+- Each run's val-best tree is retrained on the full 50k train split for 15 epochs and scored on the untouched test set over 5 shared seeds. CE and MSE are reference rows on the same seeds.
+- **PASS** iff the one-sided exact permutation p < 0.05 over runs **and** the lift is ≥ max(0.2 pp, 25% of the CE-vs-baseline gap). The rule is fixed in code before any data is seen.
+- Run order interleaves the arms, so a partial budget still gives a balanced (provisional) answer.
+
+Time is estimated by the notebook's benchmark cell; paste its output to Claude before the long run.
+
+### 0.4 A design subtlety in Phase 0 worth knowing up front
+
+With `p_target` exposed, `neg(log(p_target))` **is exactly CrossEntropy** and is reachable at tree depth 2. So the expanded search space literally contains CE. In practice Phase 0 answers "does GP find CE (or something at least as good)?" That is still a useful gate, but frame it that way. Two implementation consequences:
+- **Shapes (as built):** `error` is `(B, C)`; `p_target` is `(B, 1)`. The reduction is a sum over the class dimension, then a mean over the batch. A pure `neg(log(p_target))` tree is therefore **exactly** CE (unit-tested, gradients included). In mixed trees such as `add(square(error), neg(log(p_target)))`, the `p_target` term broadcasts across classes and is counted C times.
+- **Trivial penalty:** do *not* put `neg(log(p_target))` in `TRIVIAL_SET`. Instead, log whenever evolution rediscovers CE, since that is itself a Phase 0 finding.
+
+### 0.5 Bugs in the Phase 4b reference code (`Optimized_loss_GP.ipynb`): fix while porting
+
+The kickoff says "port verbatim". These should still be fixed, and each fix will be noted in code comments:
+1. **Resume re-runs the saved generation.** The checkpoint is written *after evaluation but before breeding*. On resume, the loop re-processes that same population: Gen 22 stats in the notebook are identical to Gen 21. It also appends the population to the novelty archive a second time, which skews novelty bonuses. Fix: checkpoint the bred next generation, or breed first on resume.
+2. **`range(start_gen, start_gen + n_generations)`** runs *n more* generations on resume, not up to *n total*. That is why the "20-generation" run ended at gen 21/31. Fix: loop to `config.generations`.
+3. **RNG state is not checkpointed**, so resume isn't reproducible. The plan in §4 already fixes this.
+4. **Fitness was measured on the same `test_loader` later used for the final comparison.** The new code keeps train / val (fitness) / test (reporting only) strictly separate.
+5. **`dill.load` fails in a fresh runtime unless DEAP `creator` classes exist first** (verified). Importing `src.gp_core` will always create them, so a post-restart resume just works.
+6. **Elitism ranks by *shared* fitness,** so the raw-best tree can drop out of the population. The notebook had to dig it out of the archive by hand. Add a hall-of-fame tracking best-by-raw-accuracy.
+7. The kickoff's early-kill threshold "<15% on 10-class" should be expressed relative to chance (`k / num_classes`). Chance was 2% on 50-way Omniglot.
+8. *(found while building)* **Constant subtrees crashed.** `torch.maximum`/`minimum` and every unary torch op raise `TypeError` on a Python float. Any tree like `tanh(sqrt(0.43))`, `max(error, 1.2)` or `square(0.72)` threw, and the wrapper silently turned that into the zero-gradient penalty, so the tree scored chance. The Phase 4b logs are full of these "Raw=2.00%" individuals. Fixed with constant-safe primitives.
+9. *(found while building)* **Max-depth limit bypassed.** The loop called `gp.cxOnePoint`/`gp.mutUniform` directly, not the `staticLimit`-decorated `toolbox.mate`/`toolbox.mutate`, so trees could grow past depth 5. Fixed.
+10. *(found while building)* The penalty fallback `1000 * mean(probs)` is a constant (softmax rows sum to 1), so it has zero gradient. NaN trees therefore trained on nothing but were still scored. The smoke test now kills them up front.
+
+All fixes are listed in the docstring of `src/evolve.py` / `src/gp_core.py`.
+
+### 0.6 H2 metric note
+
+`tree_distance` is a character-by-character `zip` of the two expression strings, not a true edit distance. Small prefix changes shift everything. Keep it as-is *inside* the evolution loop so the mechanisms match Phase 4b. For the **H2 structural-divergence analysis**, also report a proper tree edit distance (Zhang–Shasha, e.g. the `zss` package) so the paper's key Tier-1 number rests on a defensible metric.
+
+---
+
 ## 1. Compute Budget Planning (100 Compute Units)
 
 ### What 100 units buys you
@@ -93,12 +160,15 @@ drive.mount('/content/drive')
 
 !pip install -q deap dill pyyaml
 
-# Clone or pull latest code
+# Clone or pull latest code (branch Claude pushes to; see §0.1)
 import os
+BRANCH = 'claude/stoic-knuth-jenuuo'
 if not os.path.exists('/content/GP-Loss'):
-    !git clone https://github.com/danielronak/GP-Loss.git /content/GP-Loss
+    # private repo: from google.colab import userdata; token = userdata.get('GH_TOKEN')
+    # and use f'https://{token}@github.com/danielronak/GP-Loss.git'
+    !git clone -b {BRANCH} https://github.com/danielronak/GP-Loss.git /content/GP-Loss
 else:
-    !cd /content/GP-Loss && git pull
+    !cd /content/GP-Loss && git fetch origin {BRANCH} && git checkout {BRANCH} && git pull origin {BRANCH}
 
 import sys
 sys.path.insert(0, '/content/GP-Loss')
@@ -122,7 +192,7 @@ from src.config import EvolutionConfig
 ```
 1. Claude Code writes/edits src/ files locally
 2. You review and commit:  git add . && git commit -m "..." && git push
-3. In Colab: !cd /content/GP-Loss && git pull
+3. In Colab: !cd /content/GP-Loss && git pull origin claude/stoic-knuth-jenuuo
 4. Run the experiment
 5. Results save to Google Drive (checkpoints/) or to results/ in the repo
 6. Download results locally if needed for analysis
@@ -131,7 +201,7 @@ from src.config import EvolutionConfig
 
 ### Branch strategy (keep it simple)
 
-- Work on `main`. This is a research project with one developer, not production software.
+- Claude pushes to `claude/stoic-knuth-jenuuo`; Colab pulls that branch. Merge to `main` at milestones (e.g. after Phase 0) if you want a clean `main`.
 - Commit often, with descriptive messages. You'll want the history when writing the paper.
 - Tag meaningful milestones: `git tag phase0-pass` or `git tag phase0-fail`.
 
@@ -311,7 +381,7 @@ Each Colab session should follow this pattern:
 # Cell 1: Mount + Setup (30 seconds)
 drive.mount(...)
 !pip install -q deap dill pyyaml
-!cd /content/GP-Loss && git pull
+!cd /content/GP-Loss && git pull origin claude/stoic-knuth-jenuuo
 sys.path.insert(0, '/content/GP-Loss')
 
 # Cell 2: Configure (set seed, phase, architecture)

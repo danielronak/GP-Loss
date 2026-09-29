@@ -1,0 +1,35 @@
+# Phase 0: operator-expansion ceiling test (Spec §14). See src/phase0.py for
+# the pre-registered protocol and decision rule. Sized from the T4 benchmark
+# (1.22 s per 5-epoch fitness eval, 10.1 s per 10-epoch final training):
+# GP settings match Spec §6.9 defaults; estimated ~2 h total on a free-tier T4.
+phase: phase0
+dataset: fashion_mnist
+architecture: simple_cnn
+
+data:
+  val_size: 10000            # held out of the 60k train set (fitness only)
+  split_seed: 0              # one fixed split for every run and arm
+  fitness_train_size: 10000  # fitness training subset
+  fitness_val_size: 5000     # fitness validation subset
+
+arms: [baseline, tier1]      # identical except the operator set
+search_seeds: [0, 1, 2, 3, 4]  # 5 runs per arm (3 cannot reach p < 0.05)
+
+evolution:                   # EvolutionConfig overrides (seed/operator_set set per run)
+  population_size: 20
+  generations: 20            # Spec §6.9 default
+  epochs_per_individual: 8   # Spec §6.9 default
+  batch_size: 128
+  lr: 0.001
+
+final_eval:                  # retrain each run's val-best tree; score on the test set
+  seeds: [100, 101, 102, 103, 104]   # shared by every loss (paired)
+  epochs: 15                 # on the full 50k train split (Spec §6.9)
+  references:
+    CrossEntropy: ce
+    MSE: square(error)
+
+decision:
+  alpha: 0.05
+  min_effect_pp: 0.2         # smallest lift worth calling a lift (percentage points)
+  min_gap_fraction: 0.25     # ...and it must close >= 25% of the CE-vs-baseline gap

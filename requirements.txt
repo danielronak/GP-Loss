@@ -1,0 +1,8 @@
+torch>=2.0
+torchvision>=0.15
+deap>=1.4
+dill
+pyyaml
+numpy
+scipy
+pytest
