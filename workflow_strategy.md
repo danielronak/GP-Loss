@@ -1,0 +1,350 @@
+# ACLE Workflow Strategy: Claude Code + Colab Pro
+
+## The Core Principle
+
+**Claude Code writes code. Colab burns GPU. GitHub connects them.**
+
+```
+┌──────────────┐      git push       ┌──────────┐      git pull       ┌──────────────┐
+│  Local Machine│  ───────────────►  │  GitHub   │  ───────────────►  │  Colab Pro    │
+│  (Claude Code) │                    │  (Repo)   │                    │  (GPU Runtime) │
+│               │                    │           │  ◄───────────────  │               │
+│  Write code   │      results       │           │   checkpoints +    │  Run evolution │
+│  Debug logic  │  ◄─────────────── │           │   results via      │  Train models  │
+│  Analyze data │   (download/Drive) │           │   Google Drive     │  Phase 0 gate  │
+└──────────────┘                    └──────────┘                    └──────────────┘
+```
+
+---
+
+## 1. Compute Budget Planning (100 Compute Units)
+
+### What 100 units buys you
+
+| GPU Type | Approx. Hours | Cost per Hour (CU) | Best For |
+|----------|--------------|---------------------|----------|
+| T4       | ~50 hrs      | ~2 CU/hr            | Evolution runs (many short trainings) |
+| L4       | ~33 hrs      | ~3 CU/hr            | Faster evolution, transfer matrix |
+| A100     | ~12 hrs      | ~8 CU/hr            | Only if you need speed on one big run |
+
+### Recommended allocation
+
+| Phase | Task | Est. GPU Hours | Recommended GPU | Est. CU |
+|-------|------|---------------|-----------------|---------|
+| **Phase 0** | Ceiling test (baseline vs expanded, ≥5 seeds) | 3–5 hrs | T4 | ~6–10 |
+| **Phase A** | Sanity-check 3 architectures with CrossEntropy | 0.5 hrs | T4 | ~1 |
+| **Phase B** | Test `evolve_loss_for_architecture` (2 gens) | 0.5 hrs | T4 | ~1 |
+| **Phase C** | Full evolution: Arch-A, B, C (pop=20, gen=20) | 4–8 hrs | T4 or L4 | ~8–24 |
+| **Phase D** | Structural divergence analysis | ~0 (CPU) | — | 0 |
+| **Phase E** | Transfer matrix (9 cells + 3 CE × 5 seeds) | 2–3 hrs | T4 or L4 | ~4–9 |
+| **Phase G** | Confirmatory re-runs (10–20 seeds, targeted) | 3–5 hrs | T4 or L4 | ~6–15 |
+| **Buffer** | Debugging, re-runs, Colab disconnects | 3–5 hrs | T4 | ~6–10 |
+| | | **Total** | | **~32–70 CU** |
+
+> [!TIP]
+> You have enough budget — even with generous buffer. Use **T4 by default** (cheapest per CU). Only upgrade to L4 if a single evolution run is taking too long and you want to compress wall-clock time.
+
+> [!CAUTION]
+> **Do NOT leave a Colab GPU runtime idle.** Colab Pro still consumes compute units while connected, even if no code is running. Disconnect the runtime the moment a phase finishes.
+
+---
+
+## 2. Code Architecture: Write Locally, Run Remotely
+
+### What Claude Code builds (local, no GPU needed)
+
+All Python source files go in `src/`. These are **pure library code** — no Colab-specific logic, no `drive.mount()`, no `!pip install`. Claude Code can write, lint, and unit-test everything locally:
+
+```
+GP-Loss/
+├── src/
+│   ├── __init__.py
+│   ├── gp_core.py              # Operator set, EvolvedLossFunction, tree utils
+│   ├── anti_convergence.py     # All 5 anti-convergence mechanisms
+│   ├── smoke_test.py           # Single-batch validity + one-epoch early-kill
+│   ├── architectures.py        # Arch-A/B/C + registry
+│   ├── evolve.py               # evolve_loss_for_architecture() + checkpointing
+│   ├── transfer_matrix.py      # Cross-architecture matrix + stats
+│   ├── config.py               # EvolutionConfig dataclass
+│   └── utils.py                # Seeding, label remap, train_and_evaluate
+├── configs/
+│   ├── phase0_ceiling_test.yaml
+│   └── phase1_mnist_zoo.yaml
+├── notebooks/                  # Thin Colab runners (see below)
+│   ├── ACLE_Phase0.ipynb
+│   ├── ACLE_Phase1_Zoo.ipynb
+│   └── ACLE_TransferMatrix.ipynb
+├── tests/                      # Local unit tests (no GPU needed)
+│   ├── test_gp_core.py
+│   ├── test_smoke_test.py
+│   └── test_architectures.py
+├── requirements.txt
+└── README.md
+```
+
+### What Colab notebooks do (thin launchers only)
+
+Each notebook is **minimal** — just setup + a function call. All logic lives in `src/`.
+
+```python
+# === Cell 1: Setup (same in every notebook) ===
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install -q deap dill pyyaml
+
+# Clone or pull latest code
+import os
+if not os.path.exists('/content/GP-Loss'):
+    !git clone https://github.com/danielronak/GP-Loss.git /content/GP-Loss
+else:
+    !cd /content/GP-Loss && git pull
+
+import sys
+sys.path.insert(0, '/content/GP-Loss')
+
+# === Cell 2: Run the actual experiment ===
+from src.evolve import evolve_loss_for_architecture
+from src.architectures import ARCHITECTURE_ZOO
+from src.config import EvolutionConfig
+# ... call the function, save results to Drive
+```
+
+> [!IMPORTANT]
+> **Notebooks should never contain significant logic.** If you find yourself writing more than ~10 lines of actual algorithm code in a notebook cell, stop — that code belongs in `src/` where Claude Code can properly maintain it.
+
+---
+
+## 3. The Git Workflow
+
+### The cycle
+
+```
+1. Claude Code writes/edits src/ files locally
+2. You review and commit:  git add . && git commit -m "..." && git push
+3. In Colab: !cd /content/GP-Loss && git pull
+4. Run the experiment
+5. Results save to Google Drive (checkpoints/) or to results/ in the repo
+6. Download results locally if needed for analysis
+7. Back to step 1
+```
+
+### Branch strategy (keep it simple)
+
+- Work on `main`. This is a research project with one developer, not production software.
+- Commit often, with descriptive messages. You'll want the history when writing the paper.
+- Tag meaningful milestones: `git tag phase0-pass` or `git tag phase0-fail`.
+
+---
+
+## 4. Checkpointing Strategy (Survival Plan for Colab Disconnects)
+
+Colab **will** disconnect. Plan for it.
+
+### Where checkpoints go
+
+```python
+# In every notebook's setup:
+CHECKPOINT_BASE = '/content/drive/MyDrive/ACLE_Checkpoints'
+
+# Each run gets a unique directory:
+# /content/drive/MyDrive/ACLE_Checkpoints/phase0_baseline_seed42/
+# /content/drive/MyDrive/ACLE_Checkpoints/phase0_expanded_seed42/
+# /content/drive/MyDrive/ACLE_Checkpoints/evolution_A_seed42/
+# etc.
+```
+
+### What gets checkpointed (every generation)
+
+```python
+checkpoint = {
+    'generation': gen,
+    'population': population,       # dill-serialized DEAP individuals
+    'archive': archive,             # for novelty calculation
+    'best_fitness': best_fitness,
+    'diversity_trajectory': [...],
+    'fitness_trajectory': [...],
+    'config': config,               # full config for reproducibility
+    'rng_state': {                  # for exact reproducibility
+        'random': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.random.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+}
+```
+
+### The `run_manifest.json` (written at run start)
+
+```json
+{
+    "run_id": "phase0_expanded_seed42",
+    "checkpoint_dir": "/content/drive/MyDrive/ACLE_Checkpoints/phase0_expanded_seed42/",
+    "started_at": "2026-09-26T01:00:00",
+    "config": { "...": "..." },
+    "phase": "phase0",
+    "operator_set": "expanded_tier1"
+}
+```
+
+### Recovery after disconnect
+
+```python
+# evolve.py handles this automatically:
+result = evolve_loss_for_architecture(
+    model_fn=...,
+    train_loader=...,
+    val_loader=...,
+    config=config,
+    checkpoint_dir=checkpoint_dir,
+    device=device,
+    resume=True,  # <-- finds latest checkpoint and continues
+)
+```
+
+> [!WARNING]
+> **Always verify the checkpoint path at run start.** The spec documents a prior incident where hours were lost because the save path and load path didn't match. The code prints the absolute path and writes `run_manifest.json` to prevent this.
+
+---
+
+## 5. Phase-by-Phase Execution Plan
+
+### Phase 0 (the hard gate) — ~3–5 GPU hours
+
+**Before touching Colab:**
+1. Claude Code builds: `gp_core.py`, `anti_convergence.py`, `smoke_test.py`, `utils.py`, `config.py`
+2. Claude Code extends `EvolvedLossFunction` for `p_target`/`logits` terminals
+3. Claude Code writes local unit tests (CPU-only, mock data):
+   - Test that a hand-crafted `-log(p_target)` tree computes CrossEntropy ← **critical**
+   - Test smoke-test filter catches NaN/zero-grad/constant loss
+   - Test checkpointing round-trip with dill
+4. Claude Code builds `evolve.py` with resume support
+5. Claude Code creates `notebooks/ACLE_Phase0.ipynb` (thin launcher)
+6. `git push`
+
+**On Colab (T4):**
+1. Pull repo, install deps
+2. Run baseline evolution (5 seeds) — checkpoint to Drive
+3. Run expanded-operator evolution (5 seeds) — checkpoint to Drive
+4. Compare best-achievable fitness across seeds
+5. Record PASS/FAIL
+
+**After Colab:**
+1. Download results
+2. Claude Code analyzes results locally, records outcome
+3. Decision: expanded operators go forward, or baseline only
+
+### Phase 1 (Zoo + Transfer Matrix) — ~7–14 GPU hours
+
+**Before Colab:**
+1. Claude Code builds `architectures.py` (A/B/C)
+2. Claude Code creates `notebooks/ACLE_Phase1_Zoo.ipynb`
+3. `git push`
+
+**On Colab — Session 1 (sanity check + evolutions):**
+1. Sanity-check each architecture with CrossEntropy
+2. Run full evolution for Arch-A (20 gen), checkpoint every gen
+3. If time remains: start Arch-B
+
+**On Colab — Session 2 (continue evolutions):**
+1. Resume Arch-B if needed
+2. Run Arch-C
+3. Save evolved loss trees to Drive
+
+**On Colab — Session 3 (transfer matrix):**
+1. Build transfer matrix (all losses × all architectures × 5 seeds)
+2. Save raw CSV to Drive
+
+**After Colab:**
+1. Download matrix CSV
+2. Claude Code runs statistical analysis locally (paired t-tests, specificity scores — **no GPU needed**)
+3. If promising: schedule confirmatory re-runs (10–20 seeds) on Colab
+
+---
+
+## 6. Saving Compute Units: Key Tactics
+
+| Tactic | Why |
+|--------|-----|
+| **Disconnect runtime when not running code** | Idle runtimes still consume CU |
+| **Use T4 unless wall-clock time is critical** | T4 is ~2 CU/hr vs L4's ~3 CU/hr |
+| **Run analysis/stats locally** | Paired t-tests, tree distances, plotting = CPU work |
+| **Batch seeds in one session** | Avoid setup overhead across sessions |
+| **Smoke-test filter kills doomed individuals early** | Reclaims 20–40% of wasted evaluation compute |
+| **Don't debug on GPU** | Write and test code locally with Claude Code first |
+| **Checkpoint every generation** | Never redo work after a disconnect |
+| **Use `resume=True` always** | Seamless recovery |
+
+---
+
+## 7. Results Flow
+
+```
+Colab (GPU)                          Local (Claude Code)
+─────────────                        ───────────────────
+Checkpoints → Google Drive      ──►  Download for archival
+Raw CSVs    → Google Drive      ──►  Download, analyze, plot
+Evolved trees → Google Drive    ──►  Download, inspect structure
+                                     Statistical analysis (no GPU)
+                                     Paper writing assistance
+                                     Visualization / plotting
+```
+
+### What to save to the repo's `results/` directory (committed to Git):
+- `transfer_matrix.csv` (summary)
+- `transfer_matrix_raw.csv` (per-seed)
+- `evolution_trajectories.csv`
+- `structural_divergence.json`
+- `phase0_result.json` (PASS/FAIL + evidence)
+
+### What stays on Drive only (too large for Git):
+- Per-generation checkpoint files (dill-serialized populations)
+- Full archive histories
+
+---
+
+## 8. Recommended Session Structure
+
+Each Colab session should follow this pattern:
+
+```python
+# Cell 1: Mount + Setup (30 seconds)
+drive.mount(...)
+!pip install -q deap dill pyyaml
+!cd /content/GP-Loss && git pull
+sys.path.insert(0, '/content/GP-Loss')
+
+# Cell 2: Configure (set seed, phase, architecture)
+config = EvolutionConfig(seed=42, ...)
+checkpoint_dir = f'{CHECKPOINT_BASE}/evolution_A_seed42/'
+
+# Cell 3: Run (this is the one that takes hours)
+result = evolve_loss_for_architecture(...)
+
+# Cell 4: Save results (run IMMEDIATELY after Cell 3)
+save_results(result, ...)
+
+# Cell 5: Disconnect runtime (don't waste CU)
+# Runtime → Disconnect and delete runtime
+```
+
+> [!TIP]
+> **Run multiple seeds sequentially in one session** rather than one seed per session. The setup overhead (mount, install, pull, data download) is the same either way, and you avoid forgetting to disconnect.
+
+---
+
+## 9. Summary: Who Does What
+
+| Task | Where | Tool |
+|------|-------|------|
+| Write Python source code | Local | Claude Code |
+| Write/edit unit tests | Local | Claude Code |
+| Run unit tests (CPU) | Local | Claude Code / terminal |
+| Statistical analysis | Local | Claude Code |
+| Plotting / visualization | Local | Claude Code |
+| Write paper sections | Local | Claude Code |
+| Run GP evolution | Colab | T4/L4 GPU |
+| Train neural networks | Colab | T4/L4 GPU |
+| Build transfer matrix | Colab | T4/L4 GPU |
+| Store checkpoints | Google Drive | Automatic |
+| Version control | GitHub | git push/pull |
