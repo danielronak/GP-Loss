@@ -48,9 +48,9 @@ pop 20 × gen 20 is up to 400 evaluations × 8 epochs = ~3,200 epochs per evolut
 5. **First Colab action: a 2-minute timing cell** (one evaluation per architecture). We size pop/gen/epochs from real numbers.
 
 ~~3 evolution seeds per operator set~~. **Revised, as built:** 3 runs per arm cannot answer the question. Search randomness (which tree a run happens to find) is the dominant noise, so the run is the unit of replication. With 3 vs 3 runs the smallest attainable permutation p-value is 1/20 = 0.05, so a lift can never be called significant. With **5 vs 5 it is 1/252**. Levers 1–4 make each run cheap enough to afford that. Protocol (`src/phase0.py`, `configs/phase0_ceiling_test.yaml`):
-- SimpleCNN, Fashion-MNIST. Fitness = accuracy on a fixed 5k val subset after 5 epochs on a fixed 10k train subset; pop 20, 15 generations.
+- SimpleCNN, Fashion-MNIST. Fitness = accuracy on a fixed 5k val subset after 8 epochs on a fixed 10k train subset; pop 20, 20 generations (the Spec §6.9 defaults; the T4 benchmark put this at ~1.8 h total).
 - The arms differ only in operator set (`baseline` vs `tier1`). Runs with the same seed share model inits and batch order.
-- Each run's val-best tree is retrained on the full 50k train split for 10 epochs and scored on the untouched test set over 5 shared seeds. CE and MSE are reference rows on the same seeds.
+- Each run's val-best tree is retrained on the full 50k train split for 15 epochs and scored on the untouched test set over 5 shared seeds. CE and MSE are reference rows on the same seeds.
 - **PASS** iff the one-sided exact permutation p < 0.05 over runs **and** the lift is ≥ max(0.2 pp, 25% of the CE-vs-baseline gap). The rule is fixed in code before any data is seen.
 - Run order interleaves the arms, so a partial budget still gives a balanced (provisional) answer.
 

@@ -1,6 +1,7 @@
 # Phase 0: operator-expansion ceiling test (Spec §14). See src/phase0.py for
-# the pre-registered protocol and decision rule. Sized for a free-tier T4;
-# run the benchmark cell first and adjust generations/epochs if needed.
+# the pre-registered protocol and decision rule. Sized from the T4 benchmark
+# (1.22 s per 5-epoch fitness eval, 10.1 s per 10-epoch final training):
+# GP settings match Spec §6.9 defaults; estimated ~2 h total on a free-tier T4.
 phase: phase0
 dataset: fashion_mnist
 architecture: simple_cnn
@@ -16,14 +17,14 @@ search_seeds: [0, 1, 2, 3, 4]  # 5 runs per arm (3 cannot reach p < 0.05)
 
 evolution:                   # EvolutionConfig overrides (seed/operator_set set per run)
   population_size: 20
-  generations: 15
-  epochs_per_individual: 5
+  generations: 20            # Spec §6.9 default
+  epochs_per_individual: 8   # Spec §6.9 default
   batch_size: 128
   lr: 0.001
 
 final_eval:                  # retrain each run's val-best tree; score on the test set
   seeds: [100, 101, 102, 103, 104]   # shared by every loss (paired)
-  epochs: 10                 # on the full 50k train split
+  epochs: 15                 # on the full 50k train split (Spec §6.9)
   references:
     CrossEntropy: ce
     MSE: square(error)
